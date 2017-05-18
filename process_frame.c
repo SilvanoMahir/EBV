@@ -13,6 +13,7 @@
 #include <stdlib.h>
 
 #define IMG_SIZE NUM_COLORS*OSC_CAM_MAX_IMAGE_WIDTH*OSC_CAM_MAX_IMAGE_HEIGHT
+#define RGB 0 //Choose between RGB (1) and YCbCr (0)
 
 const int nc = OSC_CAM_MAX_IMAGE_WIDTH;
 const int nr = OSC_CAM_MAX_IMAGE_HEIGHT;
@@ -36,6 +37,12 @@ void Erode_3x3(int InIndex, int OutIndex);
 void Dilate_3x3(int InIndex, int OutIndex);
 void DetectRegions();
 void DrawBoundingBoxes();
+void ConvertToYCbCr(void);
+void ChangeDetection();
+enum ObjColor findColor(int index);
+
+
+
 
 
 void ResetProcess()
@@ -47,18 +54,20 @@ void ResetProcess()
 		ManualThreshold = false;
 }
 
-
 void ProcessFrame() {
 	//initialize counters
 	if(data.ipc.state.nStepCounter == 1) {
 		ManualThreshold = false;
 	} else {
-		unsigned char Threshold = OtsuThreshold(SENSORIMG);
+		//unsigned char Threshold = OtsuThreshold(SENSORIMG);
 
-		Binarize(Threshold);
+		//Binarize(Threshold);
 
-		Erode_3x3(THRESHOLD, INDEX0);
+		ChangeDetection();
+
+		Erode_3x3(INDEX1, INDEX0);
 		Dilate_3x3(INDEX0, THRESHOLD);
+
 
 		DetectRegions();
 
@@ -192,13 +201,37 @@ void DetectRegions() {
 	OscVisGetRegionProperties( &ImgRegions);
 }
 
+enum ObjColor findColor(int index){
+
+	struct OSC_VIS_REGIONS_RUN* currentRun = ImgRegions.objects[index].root;
+	int red = 0;
+	int blue = 0;
+	//get blue and red color value
+	do {
+		//loop over pixel of current run
+		for(int c = currentRun->startColumn; c <= currentRun->endColumn; c++) {
+			int r = currentRun->row;
+			//loop over color planes of pixel
+			red += data.u8TempImage[SENSORIMG][(r * nc + c) * NUM_COLORS + 2];
+			blue += data.u8TempImage[SENSORIMG][(r * nc + c) * NUM_COLORS];
+		}
+	currentRun = currentRun->next;
+	} while(currentRun != NULL);
+		if (red > blue){
+			return RED; //RED Object
+	}
+			return BLUE; //BLUE Object
+}
+
 
 void DrawBoundingBoxes() {
 	uint16 o;
+
 	for(o = 0; o < ImgRegions.noOfObjects; o++) {
 		if(ImgRegions.objects[o].area > MinArea) {
+			enum ObjColor actualColor = findColor(o);
 			DrawBoundingBox(ImgRegions.objects[o].bboxLeft, ImgRegions.objects[o].bboxTop,
-							ImgRegions.objects[o].bboxRight, ImgRegions.objects[o].bboxBottom, false, GREEN);
+							ImgRegions.objects[o].bboxRight, ImgRegions.objects[o].bboxBottom, false, actualColor);
 
 			DrawLine(ImgRegions.objects[o].centroidX-SizeCross, ImgRegions.objects[o].centroidY,
 					 ImgRegions.objects[o].centroidX+SizeCross, ImgRegions.objects[o].centroidY, RED);
@@ -208,5 +241,116 @@ void DrawBoundingBoxes() {
 		}
 	}
 }
+
+void ConvertToYCbCr() {
+
+	int r,c;
+	for(r = 0; r < nr*nc; r += nc) {
+		//loop over the columns
+		for(c = 0; c < nc; c++) {
+			//get rgb values (order is actually bgr!)
+			float B_ = data.u8TempImage[SENSORIMG][(r+c)*NUM_COLORS+0];
+			float G_ = data.u8TempImage[SENSORIMG][(r+c)*NUM_COLORS+1];
+			float R_ = data.u8TempImage[SENSORIMG][(r+c)*NUM_COLORS+2];
+			uint8 Y_ = (uint8) ( 0 + 0.299*R_ + 0.587*G_ + 0.114*B_);
+			uint8 Cb_ = (uint8) (128 - 0.169*R_ - 0.331*G_ + 0.500*B_);
+			uint8 Cr_ = (uint8) (128 + 0.500*R_ - 0.419*G_ - 0.081*B_);
+			//we write result to XXX
+			data.u8TempImage[THRESHOLD][(r+c)*NUM_COLORS+0] = Y_;
+			data.u8TempImage[THRESHOLD][(r+c)*NUM_COLORS+1] = Cb_;
+			data.u8TempImage[THRESHOLD][(r+c)*NUM_COLORS+2] = Cr_;
+		}
+	}
+}
+
+void ChangeDetection() {
+
+
+	const int NumFgrCol = 2;
+	int r, c, frg, p;
+
+	memset(data.u8TempImage[INDEX1], 0, IMG_SIZE);
+	memset(data.u8TempImage[BACKGROUND], 0, IMG_SIZE);
+
+#if RGB
+
+	uint8 FrgCol[2][3] = {{111, 80, 30}, {27, 13, 138}}; //BGR
+	//ConvertToYCbCr();
+
+	//loop over the rows
+	for(r = 0; r < nr*nc; r += nc) {
+		//loop over the columns
+		for(c = 0; c < nc; c++) {
+			//loop over the different Frg colors and find smallest difference
+			int MinDif = 1 << 30;
+			int MinInd = 0;
+			for(frg = 0; frg < NumFgrCol; frg++) {
+				int Dif = 0;
+				//loop over the color planes (r, g, b) and sum up the difference
+				for(p = 1; p < NUM_COLORS; p++) {
+					Dif += abs((int) data.u8TempImage[THRESHOLD][(r+c)*NUM_COLORS+p]-
+							(int) FrgCol[frg][p]);
+				}
+				if(Dif < MinDif) {
+					MinDif = Dif;
+					MinInd = frg;
+				}
+			}
+			//if the difference is smaller than threshold value
+			if(MinDif < data.ipc.state.nThreshold) {
+				//set pixel value to 255 in THRESHOLD image for further processing
+				//(we use only the first third of the image buffer)
+				data.u8TempImage[INDEX1][(r+c)] = 255;
+				//set pixel value to Frg color in BACKGROUND image for visualization
+				for(p = 1; p < NUM_COLORS; p++) {
+					data.u8TempImage[BACKGROUND][(r+c)*NUM_COLORS+p] = FrgCol[MinInd][p];
+				}
+			}
+		}
+	}
+
+#endif
+
+#if !RGB //YCbCr
+
+	uint8 FrgCol[2][3] = {{60, 115, 165}, {70, 145, 105}}; //CrCbY
+	ConvertToYCbCr();
+
+	//loop over the rows
+	for(r = 0; r < nr*nc; r += nc) {
+		//loop over the columns
+		for(c = 0; c < nc; c++) {
+			//loop over the different Frg colors and find smallest difference
+			int MinDif = 1 << 30;
+			int MinInd = 0;
+			for(frg = 0; frg < NumFgrCol; frg++) {
+				int Dif = 0;
+				//loop over the color planes (r, g, b) and sum up the difference
+				for(p = 1; p < NUM_COLORS; p++) {
+					Dif += abs((int) data.u8TempImage[THRESHOLD][(r+c)*NUM_COLORS+p]-
+							(int) FrgCol[frg][p]);
+				}
+				if(Dif < MinDif) {
+					MinDif = Dif;
+					MinInd = frg;
+				}
+			}
+			//if the difference is smaller than threshold value
+			if(MinDif < data.ipc.state.nThreshold) {
+				//set pixel value to 255 in THRESHOLD image for further processing
+				//(we use only the first third of the image buffer)
+				data.u8TempImage[INDEX1][(r+c)] = 255;
+				//set pixel value to Frg color in BACKGROUND image for visualization
+				for(p = 1; p < NUM_COLORS; p++) {
+					data.u8TempImage[BACKGROUND][(r+c)*NUM_COLORS+p] = FrgCol[MinInd][p];
+				}
+			}
+		}
+	}
+#endif
+
+}
+
+
 
 
